@@ -1,4 +1,9 @@
-"""采集逻辑:先固定源站当前版,再逐版补齐;失败保留原供数版。"""
+"""采集逻辑:先固定源站当前版,再逐版补齐;失败保留原供数版。
+
+每确认一版,源站原始操作(upsert/delete,含同值 upsert)连同操作前后值、
+原因编号与来源页号一并写入 raw_ops,与快照、版本登记、当前版指针同事务提交。
+缺页、抓取失败、同版同站冲突或各页原因不一致时整版不确认。
+"""
 from __future__ import annotations
 
 import os
@@ -30,6 +35,10 @@ class PageTimeout(CollectError):
 
 class VersionConflict(CollectError):
     """同版同站冲突。"""
+
+
+class ReasonMismatch(CollectError):
+    """同一版各页携带的原因编号不一致。"""
 
 
 class SourceError(CollectError):
@@ -83,9 +92,19 @@ def _check_envelope(pg: dict, version: int, page: int) -> None:
         raise SourceError(f"page {page}: bad total_pages {total!r}")
     if not isinstance(pg.get("items"), list):
         raise SourceError(f"page {page}: items is not a list")
+    reason = pg.get("reason_code")
+    if reason is not None and (not isinstance(reason, int) or isinstance(reason, bool) or reason < 0):
+        raise SourceError(f"page {page}: bad reason_code {reason!r}")
 
 
-def _validate_item(it: object, version: int) -> tuple[str, str, float | None]:
+def _check_item_reason(it: dict, sid: str, version: int):
+    reason = it.get("reason_code")
+    if reason is not None and (not isinstance(reason, int) or isinstance(reason, bool) or reason < 0):
+        raise SourceError(f"version {version} station {sid}: bad reason_code {reason!r}")
+    return reason
+
+
+def _validate_item(it: object, version: int) -> tuple[str, str, float | None, object]:
     if not isinstance(it, dict):
         raise SourceError(f"version {version}: item is not an object")
     sid = it.get("station_id")
@@ -94,50 +113,83 @@ def _validate_item(it: object, version: int) -> tuple[str, str, float | None]:
         raise SourceError(f"version {version}: bad station_id {sid!r}")
     if op not in ("upsert", "delete"):
         raise SourceError(f"version {version} station {sid}: bad op {op!r}")
+    reason = _check_item_reason(it, sid, version)
     if op == "upsert":
         pm = it.get("pm25")
         if not isinstance(pm, (int, float)) or isinstance(pm, bool) or pm < 0:
             raise SourceError(f"version {version} station {sid}: bad pm25 {pm!r}")
-        return sid, "upsert", float(pm)
-    return sid, "delete", None
+        return sid, "upsert", float(pm), reason
+    return sid, "delete", None, reason
 
 
 def _fetch_version(client: httpx.Client, version: int) -> tuple[int, list[dict]]:
-    """整版抓取:每次调用都从第 1 页重新取,绝不沿用上次尝试的残页。"""
+    """整版抓取:每次调用都从第 1 页重新取,绝不沿用上次尝试的残页。
+
+    返回去重后的操作列表,每条带 reason_code 与来源 page。
+    任一页缺页/超时/信封异常/同版同站冲突/各页原因不一致都抛 CollectError,
+    由调用方整版重试或判失败,调用期间数据只存内存、不落库。
+    """
     first = _get_json(client, f"/api/revisions/{version}/pages/1")
     _check_envelope(first, version, 1)
     total = first["total_pages"]
-    raw = list(first["items"])
+    envelope_reason = first["reason_code"]
+    raw: list[tuple[dict, int]] = [(it, 1) for it in first["items"]]
     for page in range(2, total + 1):
         pg = _get_json(client, f"/api/revisions/{version}/pages/{page}")
         _check_envelope(pg, version, page)
         if pg["total_pages"] != total:
             raise SourceError(f"version {version}: total_pages changed between pages")
-        raw.extend(pg["items"])
-    # 同版同站冲突检测(完全相同的重复记录视为幂等,去噪)
+        if pg["reason_code"] != envelope_reason:
+            # 各页原因不一致:该版整体不可确认(读数与轨迹都不确认)
+            raise ReasonMismatch(
+                f"version {version}: reason_code differs across pages: "
+                f"page 1 has {envelope_reason!r}, page {page} has {pg['reason_code']!r}"
+            )
+        raw.extend((it, page) for it in pg["items"])
+    # 同版同站冲突检测(完全相同的重复记录视为幂等,去噪;同值 upsert 若跨页重复且
+    # 原因也一致,同样按幂等去重,保留首次出现的页号与顺序)
     seen: dict[str, tuple] = {}
     items: list[dict] = []
-    for it in raw:
-        sid, op, pm = _validate_item(it, version)
+    for it, page in raw:
+        sid, op, pm, reason = _validate_item(it, version)
+        key = (op, pm, reason)
         if sid in seen:
-            if seen[sid] != (op, pm):
+            if seen[sid] != key:
                 raise VersionConflict(
                     f"version {version} station {sid}: conflicting entries in same version"
                 )
             continue
-        seen[sid] = (op, pm)
-        items.append({"station_id": sid, "op": op, "pm25": pm})
+        seen[sid] = key
+        items.append(
+            {"station_id": sid, "op": op, "pm25": pm, "reason_code": reason, "page": page}
+        )
     return total, items
 
 
-def _apply(base: dict[str, float], items: list[dict]) -> dict[str, float]:
+def _build_raw_rows(
+    hour: str, version: int, base: dict[str, float], items: list[dict]
+) -> tuple[list[tuple], dict[str, float]]:
+    """按操作顺序推导操作前后值,并生成 raw_ops 行与新版快照。
+
+    严格如实记录源站发布的每一条操作(包括与当前值相等的同值 upsert);
+    前后值只由"已确认基线 + 本版实际操作顺序"推导,不做任何快照差额补造。
+    """
     snap = dict(base)
-    for it in items:
+    rows: list[tuple] = []
+    for seq, it in enumerate(items, start=1):
+        sid = it["station_id"]
+        before = snap.get(sid)  # 不存在的站为 None -> SQL NULL
         if it["op"] == "upsert":
-            snap[it["station_id"]] = it["pm25"]
+            after = it["pm25"]
+            snap[sid] = after
         else:
-            snap.pop(it["station_id"], None)
-    return snap
+            after = None
+            snap.pop(sid, None)
+        rows.append(
+            (hour, version, seq, sid, it["op"], it["pm25"], before, after,
+             it["reason_code"], it["page"])
+        )
+    return rows, snap
 
 
 # ---------------- 采集主流程 ----------------
@@ -212,13 +264,19 @@ def _collect(hour: str) -> dict:
                 for attempt in range(1, MAX_ATTEMPTS + 1):
                     try:
                         total, items = _fetch_version(client, version)
-                        new_snap = _apply(base, items)
-                        # 3) 数据与当前版指针在同一事务生效
+                        raw_rows, new_snap = _build_raw_rows(hour, version, base, items)
+                        # 3) 原始操作 + 快照 + 版本登记 + 当前版指针在同一事务生效
                         with dbmod.tx(db):
                             db.execute(
                                 "INSERT INTO versions(hour, version, total_pages, item_count, "
                                 "station_count, confirmed_at) VALUES (?,?,?,?,?,?)",
                                 (hour, version, total, len(items), len(new_snap), _now()),
+                            )
+                            db.executemany(
+                                "INSERT INTO raw_ops(hour, version, seq, station_id, op, pm25, "
+                                "before_pm25, after_pm25, reason_code, page) "
+                                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                                raw_rows,
                             )
                             db.executemany(
                                 "INSERT INTO entries(hour, version, station_id, pm25) "
@@ -238,7 +296,8 @@ def _collect(hour: str) -> dict:
                         if attempt < MAX_ATTEMPTS:
                             time.sleep(RETRY_BACKOFF * attempt)
                 if not ok:
-                    # 缺页/超时/冲突:保留原供数版,指针不动,停止后续版本
+                    # 缺页/超时/冲突/各页原因不一致:保留原供数版,指针不动,
+                    # 失败版及后续版都不确认(读数与轨迹均不落库)
                     msg = f"version {version} failed after {MAX_ATTEMPTS} attempts: {last_err}"
                     _mark(db, hour, "failed", msg)
                     return _summary(hour, "failed", pinned, prev_current, confirmed, msg, attempts)

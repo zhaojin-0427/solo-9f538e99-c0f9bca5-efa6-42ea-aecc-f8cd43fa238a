@@ -2,7 +2,10 @@
 
 - 首版(v1)为全量站点快照;此后每版只列新增、改值(upsert)和删除(delete)。
 - 每版分页发布,响应携带连续版号 version、页号 page、总页数 total_pages。
-- 管理接口支持:发布新修订(可切换修订)、重置、注入缺页/超时/同版同站冲突故障。
+- 修订可附原因编号 reason_code(修订级默认,单条 op 可携带自身原因覆盖);
+  每个分页响应的信封与条目都会带出原因编号。
+- 管理接口支持:发布新修订(可切换修订)、重置、注入缺页/超时/同版同站冲突/
+  各页原因不一致故障。
 """
 from __future__ import annotations
 
@@ -47,13 +50,23 @@ def _paginate(items: list[dict]) -> tuple[int, dict[int, list[dict]]]:
 def _reset(station_count: int, seed: int) -> None:
     rng = random.Random(seed)
     truth = {f"S{i:02d}": round(rng.uniform(5, 150), 1) for i in range(1, station_count + 1)}
-    items = [{"station_id": sid, "op": "upsert", "pm25": pm} for sid, pm in sorted(truth.items())]
+    items = [
+        {"station_id": sid, "op": "upsert", "pm25": pm, "reason_code": None}
+        for sid, pm in sorted(truth.items())
+    ]
     total, pages = _paginate(items)
     STATE["seed"] = seed
     STATE["rng"] = rng
     STATE["truth"] = truth
     STATE["versions"] = {
-        1: {"version": 1, "items": items, "pages": pages, "total_pages": total, "created_at": _now()}
+        1: {
+            "version": 1,
+            "items": items,
+            "pages": pages,
+            "total_pages": total,
+            "reason_code": None,  # 首版为基线快照,无修订原因
+            "created_at": _now(),
+        }
     }
     STATE["current"] = 1
     STATE["faults"] = []
@@ -76,7 +89,6 @@ def _auto_delta(version: int) -> list[dict]:
     if new_id not in truth:
         ops.append({"station_id": new_id, "op": "upsert", "pm25": round(rng.uniform(5, 150), 1)})
     return ops
-
 
 def _apply_ops(ops: list[dict]) -> None:
     truth = STATE["truth"]
@@ -103,10 +115,12 @@ class Op(BaseModel):
     station_id: str = Field(min_length=1)
     op: Literal["upsert", "delete"]
     pm25: Optional[float] = Field(default=None, ge=0)
+    reason_code: Optional[int] = Field(default=None, ge=0)  # 单条原因;缺省沿用修订级原因
 
 
 class PublishRequest(BaseModel):
     ops: Optional[list[Op]] = None  # 缺省则自动生成一条确定性增量
+    reason_code: Optional[int] = Field(default=None, ge=0)  # 修订级原因编号,各页信封带出
 
 
 class ResetRequest(BaseModel):
@@ -117,7 +131,7 @@ class ResetRequest(BaseModel):
 class Fault(BaseModel):
     version: int
     page: int = Field(default=1, ge=1)
-    kind: Literal["missing", "timeout", "conflict"]
+    kind: Literal["missing", "timeout", "conflict", "reason_mismatch"]
     times: int = 1  # 触发次数;-1 表示一直生效
 
 
@@ -125,7 +139,7 @@ class FaultsRequest(BaseModel):
     faults: list[Fault]
 
 
-def _validate_explicit(ops_in: list[Op]) -> list[dict]:
+def _validate_explicit(ops_in: list[Op], revision_reason: Optional[int]) -> list[dict]:
     seen: dict[str, tuple] = {}
     ops: list[dict] = []
     for o in ops_in:
@@ -133,13 +147,14 @@ def _validate_explicit(ops_in: list[Op]) -> list[dict]:
             raise HTTPException(400, f"upsert for {o.station_id} requires pm25")
         if o.op == "delete" and o.pm25 is not None:
             raise HTTPException(400, f"delete for {o.station_id} must not carry pm25")
-        key = (o.op, o.pm25)
+        reason = o.reason_code if o.reason_code is not None else revision_reason
+        key = (o.op, o.pm25, reason)
         if o.station_id in seen:
             if seen[o.station_id] != key:
                 raise HTTPException(400, f"conflicting ops for station {o.station_id}")
             continue
         seen[o.station_id] = key
-        item = {"station_id": o.station_id, "op": o.op}
+        item = {"station_id": o.station_id, "op": o.op, "reason_code": reason}
         if o.op == "upsert":
             item["pm25"] = o.pm25
         ops.append(item)
@@ -184,6 +199,7 @@ def list_revisions():
                     "version": v,
                     "total_pages": ver["total_pages"],
                     "item_count": len(ver["items"]),
+                    "reason_code": ver.get("reason_code"),
                     "created_at": ver["created_at"],
                 }
                 for v, ver in sorted(STATE["versions"].items())
@@ -202,11 +218,15 @@ def get_page(version: int, page: int):
         items = [dict(i) for i in ver["pages"][page]]
         total = ver["total_pages"]
         first_item = dict(ver["items"][0]) if ver["items"] else None
+        reason_code = ver.get("reason_code")
         fault = _consume_fault(version, page)
     if fault == "missing":
         raise HTTPException(404, f"page {page} of version {version} not found (injected)")
     if fault == "timeout":
         time.sleep(FAULT_SLEEP)
+    if fault == "reason_mismatch":
+        # 各页原因不一致:仅篡改该页信封的修订级原因,与其它页对不上
+        reason_code = (reason_code or 0) + 1000 + page
     if fault == "conflict" and first_item is not None:
         # 同版同站冲突:追加一条与本版首条同站但取值不同的记录
         items.append(
@@ -214,9 +234,16 @@ def get_page(version: int, page: int):
                 "station_id": first_item["station_id"],
                 "op": "upsert",
                 "pm25": round((first_item.get("pm25") or 0) + 50.0, 1),
+                "reason_code": first_item.get("reason_code"),
             }
         )
-    return {"version": version, "page": page, "total_pages": total, "items": items}
+    return {
+        "version": version,
+        "page": page,
+        "total_pages": total,
+        "reason_code": reason_code,
+        "items": items,
+    }
 
 
 # ---------------- 管理接口(切换修订 / 故障注入) ----------------
@@ -235,7 +262,13 @@ def admin_reset(req: ResetRequest = ResetRequest()):
 def admin_publish(req: PublishRequest = PublishRequest()):
     with LOCK:
         version = STATE["current"] + 1
-        ops = _auto_delta(version) if req.ops is None else _validate_explicit(req.ops)
+        revision_reason = req.reason_code
+        if req.ops is None:
+            ops = _auto_delta(version)
+            for it in ops:
+                it["reason_code"] = revision_reason
+        else:
+            ops = _validate_explicit(req.ops, revision_reason)
         _apply_ops(ops)
         total, pages = _paginate(ops)
         STATE["versions"][version] = {
@@ -243,10 +276,17 @@ def admin_publish(req: PublishRequest = PublishRequest()):
             "items": ops,
             "pages": pages,
             "total_pages": total,
+            "reason_code": revision_reason,
             "created_at": _now(),
         }
         STATE["current"] = version
-        return {"version": version, "total_pages": total, "item_count": len(ops), "ops": ops}
+        return {
+            "version": version,
+            "total_pages": total,
+            "item_count": len(ops),
+            "reason_code": revision_reason,
+            "ops": ops,
+        }
 
 
 @app.get("/admin/faults")
@@ -277,7 +317,12 @@ def admin_state():
             "station_count": len(STATE["truth"]),
             "seed": STATE["seed"],
             "versions": [
-                {"version": v, "total_pages": ver["total_pages"], "item_count": len(ver["items"])}
+                {
+                    "version": v,
+                    "total_pages": ver["total_pages"],
+                    "item_count": len(ver["items"]),
+                    "reason_code": ver.get("reason_code"),
+                }
                 for v, ver in sorted(STATE["versions"].items())
             ],
             "faults": [dict(f) for f in STATE["faults"]],

@@ -1,9 +1,12 @@
 """SQLite 存储层。
 
 关键不变式:
-- 某一版的完整快照(entries)+ 版本登记(versions)+ 当前版指针(hours.current_version)
-  在同一个事务里提交,因此失败或重启都不会暴露"半版"数据。
+- 某一版的完整快照(entries)+ 原始操作(raw_ops)+ 版本登记(versions)
+  + 当前版指针(hours.current_version)在同一个事务里提交,因此失败或重启都
+  不会暴露"半版"数据,原始操作轨迹也不会出现孤儿记录。
 - 未确认版本的页面不落库,采集中的残页只存在于内存,重试时整版重取。
+- raw_ops 只如实记录源站实际发布的操作(含同值 upsert),绝不根据快照差额补造;
+  升级前已确认的老版本没有 raw_ops 行,查询轨迹时按"来源未留存"明确标识。
 """
 from __future__ import annotations
 
@@ -38,6 +41,22 @@ CREATE TABLE IF NOT EXISTS entries (
     pm25       REAL NOT NULL,
     PRIMARY KEY (hour, version, station_id)
 );
+CREATE TABLE IF NOT EXISTS raw_ops (
+    -- 源站实际发布的原始操作记录(逐页逐序保存,含同值 upsert)
+    hour        TEXT NOT NULL,
+    version     INTEGER NOT NULL,
+    seq         INTEGER NOT NULL,          -- 该版内操作顺序,从 1 开始
+    station_id  TEXT NOT NULL,
+    op          TEXT NOT NULL,             -- upsert / delete
+    pm25        REAL,                       -- delete 时为 NULL
+    before_pm25 REAL,                       -- 操作前值:该站此前不在快照中则 NULL
+    after_pm25  REAL,                       -- 操作后值:delete 后为 NULL
+    reason_code INTEGER,                    -- 源站原因编号;源站未给则 NULL
+    page        INTEGER NOT NULL,          -- 操作来自源站哪一页
+    PRIMARY KEY (hour, version, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_raw_ops_hour_station
+    ON raw_ops (hour, station_id, version, seq);
 """
 
 

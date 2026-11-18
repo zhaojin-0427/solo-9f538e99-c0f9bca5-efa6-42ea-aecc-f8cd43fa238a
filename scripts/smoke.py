@@ -10,13 +10,16 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 
 COLLECTOR = os.environ.get("COLLECTOR_URL", "http://localhost:8000").rstrip("/")
 SOURCE = os.environ.get("SOURCE_URL", "http://localhost:8001").rstrip("/")
-HOUR = os.environ.get("SMOKE_HOUR", "2026-11-18T10")
-
+# 默认用进程启动秒数派生唯一 UTC 小时(采集端只做格式校验,不查日历),
+# 避免与库里历史采集数据冲突;可用 SMOKE_HOUR 固定
+HOUR = os.environ.get("SMOKE_HOUR") or time.strftime(
+    "%Y-%m-%dT", time.gmtime()) + f"{int(time.time()) % 24:02d}"
 _checks = 0
 
 
@@ -134,6 +137,120 @@ def main() -> int:
     check("源站回退被拒绝", r["status"] == "source_regressed" and r["current_version"] == 6,
           json.dumps(r))
     check("回退后历史版仍可查", len(stations(COLLECTOR, HOUR, 6)) > 0)
+
+    print("-- 9. 同值 upsert 与原因编号:原始操作必须留存(含前后值与原因)")
+    req("POST", SOURCE, "/admin/reset", {"station_count": 20, "seed": 20261118})
+    # 新 UTC 小时,独立轨迹(主小时 +1 小时,跨天进位由采集端仅做格式校验、不查日历)
+    date_part, hh = HOUR.rsplit("T", 1)
+    HOUR2 = f"{date_part}T{(int(hh) + 1) % 24:02d}"
+    _, r = req("POST", COLLECTOR, "/collections", {"hour": HOUR2})
+    check("新小时采集 v1 成功", r["status"] == "ok" and r["confirmed_to"] == 1, json.dumps(r))
+    s01_v1 = stations(COLLECTOR, HOUR2, 1)["S01"]
+    # 显式发布:同值 upsert(S01 值不变)+ 改值(S02)+ 删除(S03),修订级原因 77,
+    # 其中 S02 用单条原因 88 覆盖
+    s02_v1 = stations(COLLECTOR, HOUR2, 1)["S02"]
+    s03_v1 = stations(COLLECTOR, HOUR2, 1)["S03"]
+    ops = [
+        {"station_id": "S01", "op": "upsert", "pm25": s01_v1},
+        {"station_id": "S02", "op": "upsert", "pm25": round(s02_v1 + 1.5, 1),
+         "reason_code": 88},
+        {"station_id": "S03", "op": "delete"},
+    ]
+    _, p = req("POST", SOURCE, "/admin/publish", {"reason_code": 77, "ops": ops})
+    check("源站回显修订级原因", p["reason_code"] == 77, json.dumps(p))
+    check("单条原因覆盖修订级原因",
+          next(o for o in p["ops"] if o["station_id"] == "S02")["reason_code"] == 88)
+    # 分页信封必须带出原因编号
+    _, pg1 = req("GET", SOURCE, f"/api/revisions/{p['version']}/pages/1")
+    check("分页信封带原因编号", pg1["reason_code"] == 77, json.dumps(pg1))
+    _, r = req("POST", COLLECTOR, "/collections", {"hour": HOUR2})
+    check("v2 采集成功", r["status"] == "ok" and r["confirmed_to"] == 2, json.dumps(r))
+
+    _, traj = req("GET", COLLECTOR, f"/hours/{HOUR2}/stations/S01/trajectory")
+    check("同值 upsert 仍有轨迹事件(基线 + 同值修订各一条)",
+          len(traj["events"]) == 2 and
+          [e["op"] for e in traj["events"]] == ["upsert", "upsert"], json.dumps(traj))
+    ev = next(e for e in traj["events"] if e["version"] == 2)
+    check("同值 upsert 前后值相等且等于原读数",
+          ev["before_pm25"] == s01_v1 and ev["after_pm25"] == s01_v1 and
+          ev["pm25"] == s01_v1, json.dumps(ev))
+    check("事件带修订级原因与来源页", ev["reason_code"] == 77 and ev["source_page"] == 1,
+          json.dumps(ev))
+    check("v1 基线事件操作前值为 NULL、原因为 NULL",
+          traj["events"][0]["before_pm25"] is None and
+          traj["events"][0]["reason_code"] is None, json.dumps(traj["events"][0]))
+    check("同值 upsert 后快照读数不变", stations(COLLECTOR, HOUR2, 2)["S01"] == s01_v1)
+
+    _, traj_s02 = req("GET", COLLECTOR, f"/hours/{HOUR2}/stations/S02/trajectory")
+    s02_v2_event = next(e for e in traj_s02["events"] if e["version"] == 2)
+    check("单条原因覆盖生效", s02_v2_event["reason_code"] == 88, json.dumps(traj_s02))
+    check("改值前后值正确", s02_v2_event["before_pm25"] == s02_v1 and
+          s02_v2_event["after_pm25"] == round(s02_v1 + 1.5, 1))
+    _, traj_s03 = req("GET", COLLECTOR, f"/hours/{HOUR2}/stations/S03/trajectory")
+    s03_delete = next(e for e in traj_s03["events"] if e["version"] == 2)
+    check("删除事件 after 为 NULL、before 有值",
+          s03_delete["op"] == "delete" and
+          s03_delete["after_pm25"] is None and
+          s03_delete["before_pm25"] == s03_v1 and
+          traj_s03["current_pm25"] is None, json.dumps(traj_s03))
+    check("当前读数口径与轨迹一致",
+          traj["current_pm25"] == stations(COLLECTOR, HOUR2)["S01"])
+    # v1 为正常确认版且有原始全量操作留存,不应出现未留存提示
+    check("正常确认版无未留存提示", traj["unretained_versions"] == [] and traj["notice"] is None,
+          json.dumps(traj))
+    req("GET", COLLECTOR, f"/hours/{HOUR2}/stations/NOPE99/trajectory", expect=404)
+    check("未知站点轨迹 404", True)
+    _, vers2 = req("GET", COLLECTOR, f"/hours/{HOUR2}/versions")
+    check("版本登记标注原始操作已留存",
+          all(v["raw_ops_retained"] for v in vers2["versions"]), json.dumps(vers2))
+
+    print("-- 10. 各页原因不一致:该版读数与轨迹都不确认,清障后可补齐")
+    # 造一个多页版本(20 条 op,源站 PAGE_SIZE=8 -> 3 页),故障篡改第 1 页信封原因,
+    # 采集端在取第 2 页时即可发现各页原因不一致
+    multi_ops = [
+        {"station_id": f"S{i:02d}", "op": "upsert", "pm25": 40.0 + i}
+        for i in range(1, 21)
+    ]
+    _, p_multi = req("POST", SOURCE, "/admin/publish",
+                     {"reason_code": 77, "ops": multi_ops})
+    bad_v = p_multi["version"]
+    check("故障版为多页版本", p_multi["total_pages"] >= 2, json.dumps(p_multi))
+    req("PUT", SOURCE, "/admin/faults",
+        {"faults": [{"version": bad_v, "page": 1, "kind": "reason_mismatch", "times": -1}]})
+    _, r = req("POST", COLLECTOR, "/collections", {"hour": HOUR2})
+    check("原因不一致采集失败", r["status"] == "failed" and
+          "reason_code differs" in (r["error"] or ""), json.dumps(r))
+    check("指针保留在 v2", r["current_version"] == 2, json.dumps(r))
+    req("GET", COLLECTOR, f"/hours/{HOUR2}/data?version={bad_v}", expect=404)
+    check("问题版读数不可查", True)
+    _, traj_during = req("GET", COLLECTOR, f"/hours/{HOUR2}/stations/S01/trajectory")
+    check("问题版轨迹不确认(无该版事件)",
+          all(e["version"] != bad_v for e in traj_during["events"]), json.dumps(traj_during))
+    req("DELETE", SOURCE, "/admin/faults")
+    _, r = req("POST", COLLECTOR, "/collections", {"hour": HOUR2})
+    check("清障后补齐问题版", r["status"] == "ok" and r["confirmed_to"] == bad_v, json.dumps(r))
+    _, traj_after = req("GET", COLLECTOR, f"/hours/{HOUR2}/stations/S01/trajectory")
+    check("补齐后轨迹只含真实操作(无失败尝试残页)",
+          any(e["version"] == bad_v for e in traj_after["events"]) and
+          traj_after["unretained_versions"] == [], json.dumps(traj_after))
+    check("补齐后该版操作原因正确",
+          all(e["reason_code"] == 77 for e in traj_after["events"]
+              if e["version"] == bad_v), json.dumps(traj_after))
+
+    print("-- 11. 重启持久化:成功版重启后读数与轨迹仍可查")
+    # 通过环境变量由外层重启脚本驱动;未设置 RESTARTED 时跳过实际重启,
+    # 仅校验当前数据齐全(restart_check.py 负责真正的重启验证)
+    if os.environ.get("RESTARTED") == "1":
+        _, r = req("POST", COLLECTOR, "/collections", {"hour": HOUR2})
+        check("重启后状态可恢复查询(up_to_date)", r["status"] == "up_to_date", json.dumps(r))
+        check("重启后读数照常可用", len(stations(COLLECTOR, HOUR2, bad_v)) > 0)
+        _, traj_rb = req("GET", COLLECTOR, f"/hours/{HOUR2}/stations/S01/trajectory")
+        check("重启后轨迹仍可查且含同值 upsert",
+              any(e["op"] == "upsert" and e["before_pm25"] == e["after_pm25"]
+                  for e in traj_rb["events"]), json.dumps(traj_rb))
+        check("重启后未留存标记仍正确", traj_rb["unretained_versions"] == [])
+    else:
+        print("       (跳过实际重启,由 scripts/restart_check.py 验证)")
 
     print(f"== smoke 全部通过 ({_checks} 项检查)")
     return 0
